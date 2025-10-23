@@ -20,8 +20,8 @@
 ---
 include:
   - board: nice_nano_v2
-    shield: corne_left
+    shield: corne_tps43_left
     cmake-args: -DCONFIG_ZMK_SPLIT_ROLE_CENTRAL=n
   - board: nice_nano_v2
-    shield: corne_right
+    shield: corne_tps43_right
     cmake-args: -DCONFIG_ZMK_SPLIT_ROLE_CENTRAL=y
