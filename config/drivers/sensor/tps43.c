@@ -24,7 +24,7 @@ LOG_MODULE_REGISTER(tps43, CONFIG_SENSOR_LOG_LEVEL);
 
 /* Forward declarations */
 static int tps43_device_init(const struct device *dev);
-static int tps43_device_reset(const struct device *dev);
+// static int tps43_device_reset(const struct device *dev);
 static int tps43_verify_device_id(const struct device *dev);
 static int tps43_configure_device(const struct device *dev);
 
@@ -133,40 +133,40 @@ static int tps43_verify_device_id(const struct device *dev)
     return 0;
 }
 
-static int tps43_device_reset(const struct device *dev)
-{
-    const struct tps43_config *config = dev->config;
-    struct tps43_data *data = dev->data;
+// static int tps43_device_reset(const struct device *dev)
+// {
+//     const struct tps43_config *config = dev->config;
+//     struct tps43_data *data = dev->data;
 
-    if (config->rst_gpio.port == NULL) {
-        LOG_WRN("No reset GPIO configured, skipping hardware reset");
-        return 0;
-    }
+//     if (config->rst_gpio.port == NULL) {
+//         LOG_WRN("No reset GPIO configured, skipping hardware reset");
+//         return 0;
+//     }
 
-    if (!gpio_is_ready_dt(&config->rst_gpio)) {
-        LOG_ERR("  ✗ Reset GPIO not ready!");
-        return -ENODEV;
-    }
+//     if (!gpio_is_ready_dt(&config->rst_gpio)) {
+//         LOG_ERR("  ✗ Reset GPIO not ready!");
+//         return -ENODEV;
+//     }
 
-    LOG_INF("Performing hardware reset via RST pin...");
+//     LOG_INF("Performing hardware reset via RST pin...");
 
-    /* Reset sequence: LOW -> wait -> HIGH -> wait */
-    gpio_pin_set_dt(&config->rst_gpio, 0);
-    k_msleep(10);
-    gpio_pin_set_dt(&config->rst_gpio, 1);
-    k_msleep(50); /* Allow device to boot */
+//     /* Reset sequence: LOW -> wait -> HIGH -> wait */
+//     gpio_pin_set_dt(&config->rst_gpio, 0);
+//     k_msleep(10);
+//     gpio_pin_set_dt(&config->rst_gpio, 1);
+//     k_msleep(50); /* Allow device to boot */
 
-    LOG_INF("  ✓ Hardware reset complete, device should be ready");
+//     LOG_INF("  ✓ Hardware reset complete, device should be ready");
 
-    /* Reset driver state */
-    data->device_ready = false;
-    data->error_count = 0;
-    data->x = 0;
-    data->y = 0;
-    data->touch_state = 0;
+//     /* Reset driver state */
+//     data->device_ready = false;
+//     data->error_count = 0;
+//     data->x = 0;
+//     data->y = 0;
+//     data->touch_state = 0;
 
-    return 0;
-}
+//     return 0;
+// }
 
 static int tps43_configure_device(const struct device *dev)
 {
@@ -218,11 +218,11 @@ static int tps43_device_init(const struct device *dev)
     LOG_INF("=== Starting TPS43 device initialization ===");
 
     /* Reset device first */
-    ret = tps43_device_reset(dev);
-    if (ret < 0) {
-        LOG_ERR("✗ Device reset failed (error: %d)", ret);
-        return ret;
-    }
+    // ret = tps43_device_reset(dev);
+    // if (ret < 0) {
+    //     LOG_ERR("✗ Device reset failed (error: %d)", ret);
+    //     return ret;
+    // }
 
     /* Verify device ID */
     ret = tps43_verify_device_id(dev);
@@ -325,13 +325,13 @@ static void tps43_work_handler(struct k_work *work)
     k_mutex_unlock(&data->lock);
 }
 
-static void tps43_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
+// static void tps43_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+// {
     // struct tps43_data *data = CONTAINER_OF(cb, struct tps43_data, gpio_cb);
     
     /* Schedule work to handle interrupt in work queue context */
-    k_work_reschedule(&data->work, K_NO_WAIT);
-}
+    // k_work_reschedule(&data->work, K_NO_WAIT);
+// }
 
 static int tps43_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
@@ -473,19 +473,19 @@ static int tps43_init(const struct device *dev)
     /* Configure reset GPIO */
     LOG_INF("Checking RST GPIO (Pro Micro pin 9 → P0.08)...");
     if (config->rst_gpio.port != NULL) {
-        LOG_INF("  RST GPIO port: %s, pin: %d", config->rst_gpio.port->name, config->rst_gpio.pin);
-        if (gpio_is_ready_dt(&config->rst_gpio)) {
-            LOG_INF("  RST GPIO is ready, configuring as output...");
-            ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_ACTIVE);
-            if (ret < 0) {
-                LOG_ERR("  ✗ Failed to configure reset GPIO: %d", ret);
-                return ret;
-            }
-            LOG_INF("  ✓ RST GPIO configured successfully");
-        } else {
-            LOG_ERR("  ✗ RST GPIO not ready!");
-            return -ENODEV;
-        }
+        // LOG_INF("  RST GPIO port: %s, pin: %d", config->rst_gpio.port->name, config->rst_gpio.pin);
+        // if (gpio_is_ready_dt(&config->rst_gpio)) {
+        //     LOG_INF("  RST GPIO is ready, configuring as output...");
+        //     ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_ACTIVE);
+        //     if (ret < 0) {
+        //         LOG_ERR("  ✗ Failed to configure reset GPIO: %d", ret);
+        //         return ret; 
+        //     }
+        //     LOG_INF("  ✓ RST GPIO configured successfully");
+        // } else {
+        //     LOG_ERR("  ✗ RST GPIO not ready!");
+        //     return -ENODEV;
+        // }
     } else {
         LOG_WRN("  RST GPIO not specified in devicetree");
     }
@@ -495,22 +495,22 @@ static int tps43_init(const struct device *dev)
     if (config->int_gpio.port != NULL) {
         LOG_INF("  INT GPIO port: %s, pin: %d", config->int_gpio.port->name, config->int_gpio.pin);
         if (gpio_is_ready_dt(&config->int_gpio)) {
-            LOG_INF("  INT GPIO is ready, configuring as input...");
-            ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
-            if (ret < 0) {
-                LOG_ERR("  ✗ Failed to configure interrupt GPIO: %d", ret);
-                return ret;
-            }
-            LOG_INF("  ✓ INT GPIO configured successfully");
+        //     LOG_INF("  INT GPIO is ready, configuring as input...");
+        //     ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
+        //     if (ret < 0) {
+        //         LOG_ERR("  ✗ Failed to configure interrupt GPIO: %d", ret);
+        //         return ret;
+        //     }
+        //     LOG_INF("  ✓ INT GPIO configured successfully");
 
-            LOG_INF("  Adding GPIO callback...");
-            gpio_init_callback(&data->gpio_cb, tps43_gpio_callback, BIT(config->int_gpio.pin));
-            ret = gpio_add_callback(config->int_gpio.port, &data->gpio_cb);
-            if (ret < 0) {
-                LOG_ERR("  ✗ Failed to add GPIO callback: %d", ret);
-                return ret;
-            }
-            LOG_INF("  ✓ GPIO callback added successfully");
+        //     LOG_INF("  Adding GPIO callback...");
+        //     gpio_init_callback(&data->gpio_cb, tps43_gpio_callback, BIT(config->int_gpio.pin));
+        //     ret = gpio_add_callback(config->int_gpio.port, &data->gpio_cb);
+        //     if (ret < 0) {
+        //         LOG_ERR("  ✗ Failed to add GPIO callback: %d", ret);
+        //         return ret;
+        //     }
+        //     LOG_INF("  ✓ GPIO callback added successfully");
         } else {
             LOG_WRN("  INT GPIO not ready (will use polling mode)");
         }
@@ -534,8 +534,8 @@ static int tps43_init(const struct device *dev)
                                                                              \
     static const struct tps43_config tps43_config_##inst = {                \
         .i2c = I2C_DT_SPEC_INST_GET(inst),                                 \
-        .int_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, int_gpios, {0}),        \
-        .rst_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}),        \
+        .int_gpio = {0} /* GPIO_DT_SPEC_INST_GET_OR(inst, int_gpios, {0}) */,        \
+        .rst_gpio = {0} /* GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}) */,        \
         .resolution_x = DT_INST_PROP_OR(inst, resolution_x, 0),            \
         .resolution_y = DT_INST_PROP_OR(inst, resolution_y, 0),            \
         .invert_x = DT_INST_PROP_OR(inst, invert_x, false),                \
