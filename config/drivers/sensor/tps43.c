@@ -65,16 +65,20 @@ static int tps43_i2c_read_reg(const struct device *dev, uint8_t reg, uint8_t *da
 {
     const struct tps43_config *config = dev->config;
     int ret;
-    
+
     /* Add small delay to prevent I2C bus flooding */
     k_msleep(1);
-    
+
+    LOG_DBG("I2C READ: addr=0x%02X reg=0x%02X len=%d", config->i2c.addr, reg, len);
+
     ret = i2c_write_read_dt(&config->i2c, &reg, 1, data, len);
     if (ret < 0) {
         LOG_ERR("Failed to read register 0x%02x: %d", reg, ret);
         return ret;
     }
-    
+
+    LOG_DBG("I2C READ SUCCESS: reg=0x%02X data[0]=0x%02X", reg, data[0]);
+
     return 0;
 }
 
@@ -83,19 +87,24 @@ static int tps43_i2c_write_reg(const struct device *dev, uint8_t reg, uint8_t *d
     const struct tps43_config *config = dev->config;
     uint8_t buffer[len + 1];
     int ret;
-    
+
     buffer[0] = reg;
     memcpy(&buffer[1], data, len);
-    
+
     /* Add small delay to prevent I2C bus flooding */
     k_msleep(1);
-    
+
+    LOG_DBG("I2C WRITE: addr=0x%02X reg=0x%02X len=%d data[0]=0x%02X",
+            config->i2c.addr, reg, len, data[0]);
+
     ret = i2c_write_dt(&config->i2c, buffer, len + 1);
     if (ret < 0) {
         LOG_ERR("Failed to write register 0x%02x: %d", reg, ret);
         return ret;
     }
-    
+
+    LOG_DBG("I2C WRITE SUCCESS: reg=0x%02X", reg);
+
     return 0;
 }
 
