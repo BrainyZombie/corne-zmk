@@ -444,10 +444,59 @@ static int tps43_init(const struct device *dev)
     }
 
     LOG_INF("  ✓ I2C bus is ready!");
-    LOG_INF("I2C bus scanning for devices...");
 
-    /* Scan I2C bus for devices (7-bit addressing: 0x08 to 0x77) */
+    /* Read GPIO pin states for I2C lines */
+    const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+    if (device_is_ready(gpio0)) {
+        int sda_state = gpio_pin_get_raw(gpio0, 17);  // P0.17 = SDA
+        int scl_state = gpio_pin_get_raw(gpio0, 20);  // P0.20 = SCL
+        LOG_INF("GPIO Pin States:");
+        LOG_INF("  SDA (P0.17): %s (%d)", sda_state ? "HIGH" : "LOW", sda_state);
+        LOG_INF("  SCL (P0.20): %s (%d)", scl_state ? "HIGH" : "LOW", scl_state);
+    } else {
+        LOG_WRN("Could not read GPIO pin states");
+    }
+
+    /* Continuous I2C scanning: 5s scan, 5s pause, repeat */
+    LOG_INF("Starting continuous I2C scanning (5s on, 5s off)...");
+
+    for (int cycle = 0; cycle < 3; cycle++) {  // Do 3 cycles for testing
+        LOG_INF("=== Scan Cycle %d - SCANNING (measure with multimeter now) ===", cycle + 1);
+
+        /* Scan I2C bus for devices (7-bit addressing: 0x08 to 0x77) */
+        uint32_t scan_start = k_uptime_get_32();
+        int found_devices = 0;
+        int scan_count = 0;
+
+        while ((k_uptime_get_32() - scan_start) < 5000) {  // Scan for 5 seconds
+            for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+                struct i2c_msg msg = {
+                    .buf = NULL,
+                    .len = 0,
+                    .flags = I2C_MSG_WRITE | I2C_MSG_STOP,
+                };
+
+                ret = i2c_transfer_dt(&config->i2c, &msg, 1);
+                if (ret == 0) {
+                    found_devices++;
+                }
+            }
+            scan_count++;
+            k_msleep(10);  // Small delay between scan iterations
+        }
+
+        LOG_INF("Scan complete: Found devices at %d addresses (%d scan iterations)",
+                found_devices / scan_count, scan_count);
+
+        LOG_INF("=== Scan Cycle %d - PAUSED (measure idle state now) ===", cycle + 1);
+        k_msleep(5000);  // Pause for 5 seconds
+    }
+
+    LOG_INF("Continuous scanning complete. Now doing single scan...");
+
+    /* Do one final scan and list all addresses */
     int found_devices = 0;
+    LOG_INF("Final I2C bus scan for devices...");
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
         struct i2c_msg msg = {
             .buf = NULL,
