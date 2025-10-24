@@ -18,32 +18,29 @@
 
 LOG_MODULE_REGISTER(tps43, CONFIG_SENSOR_LOG_LEVEL);
 
-#if CONFIG_ZMK_SENSOR_TPS43_GESTURE_SUPPORT
-// Gesture-related code would go here
-#endif
-
 /* Forward declarations */
-static int tps43_device_init(const struct device *dev);
-// static int tps43_device_reset(const struct device *dev);
-static int tps43_verify_device_id(const struct device *dev);
-static int tps43_configure_device(const struct device *dev);
+static int iqs5xx_device_init(const struct device *dev);
+static int iqs5xx_verify_product_id(const struct device *dev);
+static int iqs5xx_configure_device(const struct device *dev);
+static int iqs5xx_close_comms_window(const struct device *dev);
+static int iqs5xx_ack_event(const struct device *dev);
 
 struct tps43_data {
     struct k_work_delayable work;
     struct k_mutex lock;
     const struct device *dev;
-    
+
     /* Touch data */
     int16_t x;
     int16_t y;
     uint8_t touch_state;
     uint8_t touch_strength;
-    
+
     /* Device state */
     bool device_ready;
     bool initialized;
     uint8_t error_count;
-    
+
     /* Callbacks */
     sensor_trigger_handler_t trigger_handler;
     const struct sensor_trigger *trigger;
@@ -53,196 +50,244 @@ struct tps43_config {
     struct i2c_dt_spec i2c;
     struct gpio_dt_spec int_gpio;
     struct gpio_dt_spec rst_gpio;
-    uint8_t resolution_x;
-    uint8_t resolution_y;
+    uint16_t resolution_x;
+    uint16_t resolution_y;
     bool invert_x;
     bool invert_y;
     bool swap_xy;
 };
 
-/* I2C helper functions with error recovery */
-static int tps43_i2c_read_reg(const struct device *dev, uint8_t reg, uint8_t *data, size_t len)
+/* ============================================================================
+ * I2C Helper Functions for 16-bit Big-Endian Register Addressing
+ * ============================================================================ */
+
+/**
+ * Read from IQS5xx register (16-bit address, big-endian)
+ */
+static int iqs5xx_read_reg(const struct device *dev, uint16_t reg, uint8_t *data, size_t len)
 {
     const struct tps43_config *config = dev->config;
+    uint8_t reg_addr[2];
     int ret;
 
-    /* Add small delay to prevent I2C bus flooding */
-    k_msleep(1);
+    /* Convert register address to big-endian */
+    reg_addr[0] = (reg >> 8) & 0xFF;  /* MSB */
+    reg_addr[1] = reg & 0xFF;          /* LSB */
 
-    LOG_DBG("I2C READ: addr=0x%02X reg=0x%02X len=%d", config->i2c.addr, reg, len);
+    LOG_DBG("I2C READ: addr=0x%02X reg=0x%04X len=%d", config->i2c.addr, reg, len);
 
-    ret = i2c_write_read_dt(&config->i2c, &reg, 1, data, len);
+    /* IQS5xx uses write-then-read for register access */
+    ret = i2c_write_read_dt(&config->i2c, reg_addr, 2, data, len);
     if (ret < 0) {
-        LOG_ERR("Failed to read register 0x%02x: %d", reg, ret);
+        LOG_ERR("Failed to read register 0x%04X: %d", reg, ret);
         return ret;
     }
 
-    LOG_DBG("I2C READ SUCCESS: reg=0x%02X data[0]=0x%02X", reg, data[0]);
+    if (len > 0) {
+        LOG_DBG("I2C READ SUCCESS: reg=0x%04X data[0]=0x%02X", reg, data[0]);
+    }
 
     return 0;
 }
 
-static int tps43_i2c_write_reg(const struct device *dev, uint8_t reg, uint8_t *data, size_t len)
+/**
+ * Write to IQS5xx register (16-bit address, big-endian)
+ */
+static int iqs5xx_write_reg(const struct device *dev, uint16_t reg, const uint8_t *data, size_t len)
 {
     const struct tps43_config *config = dev->config;
-    uint8_t buffer[len + 1];
+    uint8_t buffer[len + 2];
     int ret;
 
-    buffer[0] = reg;
-    memcpy(&buffer[1], data, len);
+    /* Build packet: [reg_msb][reg_lsb][data...] */
+    buffer[0] = (reg >> 8) & 0xFF;  /* MSB */
+    buffer[1] = reg & 0xFF;          /* LSB */
+    memcpy(&buffer[2], data, len);
 
-    /* Add small delay to prevent I2C bus flooding */
-    k_msleep(1);
+    LOG_DBG("I2C WRITE: addr=0x%02X reg=0x%04X len=%d", config->i2c.addr, reg, len);
 
-    LOG_DBG("I2C WRITE: addr=0x%02X reg=0x%02X len=%d data[0]=0x%02X",
-            config->i2c.addr, reg, len, data[0]);
-
-    ret = i2c_write_dt(&config->i2c, buffer, len + 1);
+    ret = i2c_write_dt(&config->i2c, buffer, len + 2);
     if (ret < 0) {
-        LOG_ERR("Failed to write register 0x%02x: %d", reg, ret);
+        LOG_ERR("Failed to write register 0x%04X: %d", reg, ret);
         return ret;
     }
 
-    LOG_DBG("I2C WRITE SUCCESS: reg=0x%02X", reg);
+    LOG_DBG("I2C WRITE SUCCESS: reg=0x%04X", reg);
 
     return 0;
 }
 
-static int tps43_verify_device_id(const struct device *dev)
+/**
+ * Close communication window by writing to END_COMM register
+ */
+static int iqs5xx_close_comms_window(const struct device *dev)
 {
     const struct tps43_config *config = dev->config;
-    uint8_t device_info[2];
+    uint8_t reg_addr[2];
     int ret;
 
-    LOG_INF("Reading device ID from I2C address 0x%02X...", config->i2c.addr);
-    ret = tps43_i2c_read_reg(dev, TPS43_REG_DEVICE_INFO, device_info, 2);
+    /* END_COMM is special - just write the register address itself */
+    reg_addr[0] = (IQS5XX_END_COMM >> 8) & 0xFF;
+    reg_addr[1] = IQS5XX_END_COMM & 0xFF;
+
+    LOG_DBG("Closing communication window (0xEEEE)");
+
+    ret = i2c_write_dt(&config->i2c, reg_addr, 2);
     if (ret < 0) {
-        LOG_ERR("  ✗ Failed to read device info (error: %d)", ret);
+        LOG_ERR("Failed to close comms window: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/**
+ * Acknowledge event by writing to SYS_CTRL0
+ */
+static int iqs5xx_ack_event(const struct device *dev)
+{
+    uint8_t ack = IQS5XX_ACK_RESET;
+    int ret;
+
+    LOG_DBG("Acknowledging event (SYS_CTRL0)");
+
+    ret = iqs5xx_write_reg(dev, IQS5XX_SYS_CTRL0, &ack, 1);
+    if (ret < 0) {
+        LOG_ERR("Failed to acknowledge event: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* ============================================================================
+ * Device Initialization
+ * ============================================================================ */
+
+/**
+ * Verify product number (should be 58 for IQS572)
+ */
+static int iqs5xx_verify_product_id(const struct device *dev)
+{
+    const struct tps43_config *config = dev->config;
+    uint8_t prod_num_data[2];
+    uint16_t product_num;
+    int ret;
+
+    LOG_INF("Reading product number from 0x%02X...", config->i2c.addr);
+
+    ret = iqs5xx_read_reg(dev, IQS5XX_PROD_NUM, prod_num_data, 2);
+    if (ret < 0) {
+        LOG_ERR("✗ Failed to read product number (error: %d)", ret);
         LOG_ERR("  Possible causes:");
-        LOG_ERR("    - Device not connected or powered");
-        LOG_ERR("    - Wrong I2C address (try 0x75 if using 0x74)");
-        LOG_ERR("    - Wiring issue (SDA/SCL swapped or disconnected)");
+        LOG_ERR("    - Device not powered");
+        LOG_ERR("    - Wrong I2C address");
+        LOG_ERR("    - Wiring issue");
         LOG_ERR("    - Pull-up resistors missing");
         return ret;
     }
 
-    uint16_t product_id = sys_get_le16(device_info);
-    LOG_INF("  ✓ Device Product ID: 0x%04X", product_id);
+    /* Product number is stored as big-endian */
+    product_num = sys_get_be16(prod_num_data);
 
-    /* IQS572 should return specific product ID */
-    if (product_id != TPS43_EXPECTED_PRODUCT_ID) {
-        LOG_WRN("  ⚠ Unexpected product ID: 0x%04X (expected: 0x%04X)",
-                product_id, TPS43_EXPECTED_PRODUCT_ID);
-        LOG_WRN("  Device may not be IQS572/TPS43");
-        /* Don't fail completely - some variants might have different IDs */
+    LOG_INF("✓ Product Number: 0x%04X (decimal: %u)", product_num, product_num);
+
+    /* Verify it's an IQS572 */
+    if (product_num != IQS5XX_PROD_NUM_IQS572) {
+        LOG_WRN("⚠ Unexpected product number: %u (expected: %u for IQS572)",
+                product_num, IQS5XX_PROD_NUM_IQS572);
+        LOG_WRN("  Device may be IQS550 (%u) or IQS525 (%u)",
+                IQS5XX_PROD_NUM_IQS550, IQS5XX_PROD_NUM_IQS525);
+        /* Don't fail - other IQS5xx variants should work too */
     } else {
-        LOG_INF("  ✓ Product ID matches IQS572 controller");
+        LOG_INF("✓ Confirmed IQS572 trackpad controller");
     }
 
     return 0;
 }
 
-// static int tps43_device_reset(const struct device *dev)
-// {
-//     const struct tps43_config *config = dev->config;
-//     struct tps43_data *data = dev->data;
-
-//     if (config->rst_gpio.port == NULL) {
-//         LOG_WRN("No reset GPIO configured, skipping hardware reset");
-//         return 0;
-//     }
-
-//     if (!gpio_is_ready_dt(&config->rst_gpio)) {
-//         LOG_ERR("  ✗ Reset GPIO not ready!");
-//         return -ENODEV;
-//     }
-
-//     LOG_INF("Performing hardware reset via RST pin...");
-
-//     /* Reset sequence: LOW -> wait -> HIGH -> wait */
-//     gpio_pin_set_dt(&config->rst_gpio, 0);
-//     k_msleep(10);
-//     gpio_pin_set_dt(&config->rst_gpio, 1);
-//     k_msleep(50); /* Allow device to boot */
-
-//     LOG_INF("  ✓ Hardware reset complete, device should be ready");
-
-//     /* Reset driver state */
-//     data->device_ready = false;
-//     data->error_count = 0;
-//     data->x = 0;
-//     data->y = 0;
-//     data->touch_state = 0;
-
-//     return 0;
-// }
-
-static int tps43_configure_device(const struct device *dev)
+/**
+ * Configure device settings
+ */
+static int iqs5xx_configure_device(const struct device *dev)
 {
     const struct tps43_config *config = dev->config;
     uint8_t sys_cfg[2];
     int ret;
-    
+
+    LOG_INF("Configuring IQS5xx device...");
+
     /* Read current system configuration */
-    ret = tps43_i2c_read_reg(dev, TPS43_REG_SYS_CONFIG, sys_cfg, 2);
+    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_CFG0, sys_cfg, 2);
     if (ret < 0) {
         LOG_ERR("Failed to read system config");
         return ret;
     }
-    
-    /* Configure based on DT properties */
+
+    LOG_DBG("Current config: SYS_CFG0=0x%02X SYS_CFG1=0x%02X", sys_cfg[0], sys_cfg[1]);
+
+    /* Configure SYS_CFG0: Setup complete, enable WDT, enable re-ATI */
+    sys_cfg[0] = IQS5XX_SETUP_COMPLETE | IQS5XX_WDT | IQS5XX_REATI;
+
+    /* Configure SYS_CFG1: Coordinate transformations and event mode */
+    sys_cfg[1] = IQS5XX_TP_EVENT | IQS5XX_EVENT_MODE;  /* Enable touch events */
+
     if (config->invert_x) {
-        sys_cfg[0] |= TPS43_SYS_CFG_FLIP_X;
+        sys_cfg[1] |= IQS5XX_FLIP_X;
+        LOG_DBG("  Enabling X flip");
     }
     if (config->invert_y) {
-        sys_cfg[0] |= TPS43_SYS_CFG_FLIP_Y;
+        sys_cfg[1] |= IQS5XX_FLIP_Y;
+        LOG_DBG("  Enabling Y flip");
     }
     if (config->swap_xy) {
-        sys_cfg[0] |= TPS43_SYS_CFG_SWITCH_XY;
+        sys_cfg[1] |= IQS5XX_SWITCH_XY;
+        LOG_DBG("  Enabling XY swap");
     }
-    
-    /* Enable touch and proximity detection */
-    sys_cfg[1] |= TPS43_SYS_CFG_TP_EVENT | TPS43_SYS_CFG_PROX_EVENT;
-    
-    ret = tps43_i2c_write_reg(dev, TPS43_REG_SYS_CONFIG, sys_cfg, 2);
+
+    LOG_DBG("Writing config: SYS_CFG0=0x%02X SYS_CFG1=0x%02X", sys_cfg[0], sys_cfg[1]);
+
+    ret = iqs5xx_write_reg(dev, IQS5XX_SYS_CFG0, sys_cfg, 2);
     if (ret < 0) {
         LOG_ERR("Failed to write system config");
         return ret;
     }
 
-    /* Note: TPS43 (IQS572) has fixed hardware resolution (2048x1792)
-     * The resolution_x/y config values are for coordinate scaling only,
-     * not written to device registers. */
-    LOG_INF("Device configured successfully (resolution: %dx%d)",
+    /* Close communication window after config */
+    ret = iqs5xx_close_comms_window(dev);
+    if (ret < 0) {
+        return ret;
+    }
+
+    /* Wait for Automatic Tuning Implementation (ATI) to complete */
+    LOG_INF("Waiting %dms for ATI to complete...", IQS5XX_ATI_WAIT_MS);
+    k_msleep(IQS5XX_ATI_WAIT_MS);
+
+    LOG_INF("✓ Device configured successfully (resolution: %dx%d)",
             config->resolution_x, config->resolution_y);
 
     return 0;
 }
 
-static int tps43_device_init(const struct device *dev)
+/**
+ * Initialize the IQS5xx device
+ */
+static int iqs5xx_device_init(const struct device *dev)
 {
     struct tps43_data *data = dev->data;
     int ret;
 
-    LOG_INF("=== Starting TPS43 device initialization ===");
+    LOG_INF("=== Starting IQS5xx device initialization ===");
 
-    /* Reset device first */
-    // ret = tps43_device_reset(dev);
-    // if (ret < 0) {
-    //     LOG_ERR("✗ Device reset failed (error: %d)", ret);
-    //     return ret;
-    // }
-
-    /* Verify device ID */
-    ret = tps43_verify_device_id(dev);
+    /* Verify product ID */
+    ret = iqs5xx_verify_product_id(dev);
     if (ret < 0) {
         LOG_ERR("✗ Device verification failed (error: %d)", ret);
         return ret;
     }
 
     /* Configure device */
-    LOG_INF("Configuring device registers...");
-    ret = tps43_configure_device(dev);
+    ret = iqs5xx_configure_device(dev);
     if (ret < 0) {
         LOG_ERR("✗ Device configuration failed (error: %d)", ret);
         return ret;
@@ -251,51 +296,91 @@ static int tps43_device_init(const struct device *dev)
     data->device_ready = true;
     data->initialized = true;
 
-    LOG_INF("=== ✓ TPS43 device initialized successfully ===");
+    LOG_INF("=== ✓ IQS5xx device initialized successfully ===");
     return 0;
 }
 
-static int tps43_read_touch_data(const struct device *dev)
+/* ============================================================================
+ * Touch Data Reading
+ * ============================================================================ */
+
+/**
+ * Read touch data from device
+ */
+static int iqs5xx_read_touch_data(const struct device *dev)
 {
     struct tps43_data *data = dev->data;
-    uint8_t touch_data[8];
+    uint8_t touch_data[43];  /* SYS_INFO0 + full finger data */
     int ret;
-    
+
     if (!data->device_ready) {
         return -ENODEV;
     }
-    
-    /* Read XY info and coordinates in one transaction */
-    ret = tps43_i2c_read_reg(dev, TPS43_REG_XY_INFO_0, touch_data, 8);
+
+    /* Read from SYS_INFO0: includes num_fingers + all finger data */
+    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_INFO0, touch_data, sizeof(touch_data));
     if (ret < 0) {
         LOG_ERR("Failed to read touch data");
         data->error_count++;
-        if (data->error_count > TPS43_MAX_ERROR_COUNT) {
+        if (data->error_count > IQS5XX_MAX_ERROR_COUNT) {
             LOG_WRN("Too many errors, reinitializing device");
             data->device_ready = false;
             k_work_reschedule(&data->work, K_MSEC(100));
         }
         return ret;
     }
-    
+
     /* Reset error count on successful read */
     data->error_count = 0;
-    
-    /* Parse touch data */
-    uint8_t xy_info = touch_data[0];
-    data->touch_state = (xy_info & TPS43_XY_INFO_TOUCH_MASK) ? 1 : 0;
-    
-    if (data->touch_state) {
-        /* Extract coordinates */
-        data->x = sys_get_le16(&touch_data[4]);
-        data->y = sys_get_le16(&touch_data[6]);
-        data->touch_strength = touch_data[2];
-        
-        LOG_DBG("Touch: x=%d, y=%d, strength=%d", data->x, data->y, data->touch_strength);
+
+    /* Parse touch data
+     * Byte 0-1: SYS_INFO (we skip this for now)
+     * Byte 2: Number of fingers
+     * Byte 3-12: First finger data (if present)
+     *   - Bytes 3-4: Reserved
+     *   - Bytes 5-6: Absolute X (big-endian)
+     *   - Bytes 7-8: Absolute Y (big-endian)
+     *   - Bytes 9-10: Touch strength (big-endian)
+     *   - Bytes 11-12: Area
+     */
+    uint8_t num_fingers = touch_data[2];
+
+    if (num_fingers > 0 && num_fingers <= IQS5XX_MAX_TOUCHES) {
+        data->touch_state = 1;
+
+        /* Parse first finger data (offset by 3 bytes for SYS_INFO + num_fingers) */
+        data->x = sys_get_be16(&touch_data[3 + 2]);  /* Skip 2 reserved bytes */
+        data->y = sys_get_be16(&touch_data[3 + 4]);
+        uint16_t strength = sys_get_be16(&touch_data[3 + 6]);
+        data->touch_strength = (strength >> 8) & 0xFF;  /* Use MSB */
+
+        LOG_DBG("Touch: fingers=%d x=%d y=%d strength=%d",
+                num_fingers, data->x, data->y, data->touch_strength);
+    } else {
+        data->touch_state = 0;
+        LOG_DBG("No touch detected");
     }
-    
+
+    /* Acknowledge the event */
+    ret = iqs5xx_ack_event(dev);
+    if (ret < 0) {
+        LOG_WRN("Failed to ACK event: %d", ret);
+        /* Don't fail - continue anyway */
+    }
+
+    /* Close communication window */
+    ret = iqs5xx_close_comms_window(dev);
+    if (ret < 0) {
+        LOG_WRN("Failed to close comms window: %d", ret);
+        /* Don't fail - continue anyway */
+    }
+
     return 0;
 }
+
+/* ============================================================================
+ * Work Queue Handler
+ * ============================================================================ */
 
 static void tps43_work_handler(struct k_work *work)
 {
@@ -303,13 +388,13 @@ static void tps43_work_handler(struct k_work *work)
     struct tps43_data *data = CONTAINER_OF(delayable_work, struct tps43_data, work);
     const struct device *dev = data->dev;
     int ret;
-    
+
     k_mutex_lock(&data->lock, K_FOREVER);
-    
+
     /* Reinitialize device if needed */
     if (!data->device_ready) {
         LOG_INF("Reinitializing device");
-        ret = tps43_device_init(dev);
+        ret = iqs5xx_device_init(dev);
         if (ret < 0) {
             LOG_ERR("Device reinitialization failed");
             k_mutex_unlock(&data->lock);
@@ -318,52 +403,48 @@ static void tps43_work_handler(struct k_work *work)
             return;
         }
     }
-    
+
     /* Read touch data */
-    ret = tps43_read_touch_data(dev);
+    ret = iqs5xx_read_touch_data(dev);
     if (ret < 0) {
         k_mutex_unlock(&data->lock);
         return;
     }
-    
+
     /* Trigger callback if configured */
     if (data->trigger_handler && data->trigger) {
         data->trigger_handler(dev, data->trigger);
     }
-    
+
     k_mutex_unlock(&data->lock);
 }
 
-// static void tps43_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-// {
-    // struct tps43_data *data = CONTAINER_OF(cb, struct tps43_data, gpio_cb);
-    
-    /* Schedule work to handle interrupt in work queue context */
-    // k_work_reschedule(&data->work, K_NO_WAIT);
-// }
+/* ============================================================================
+ * Sensor API Implementation
+ * ============================================================================ */
 
 static int tps43_sample_fetch(const struct device *dev, enum sensor_channel chan)
 {
     struct tps43_data *data = dev->data;
     int ret;
-    
+
     if (chan != SENSOR_CHAN_ALL && chan != SENSOR_CHAN_POS_DX && chan != SENSOR_CHAN_POS_DY) {
         return -ENOTSUP;
     }
-    
+
     k_mutex_lock(&data->lock, K_FOREVER);
-    ret = tps43_read_touch_data(dev);
+    ret = iqs5xx_read_touch_data(dev);
     k_mutex_unlock(&data->lock);
-    
+
     return ret;
 }
 
 static int tps43_channel_get(const struct device *dev, enum sensor_channel chan, struct sensor_value *val)
 {
     struct tps43_data *data = dev->data;
-    
+
     k_mutex_lock(&data->lock, K_FOREVER);
-    
+
     switch (chan) {
     case SENSOR_CHAN_POS_DX:
         val->val1 = data->x;
@@ -377,7 +458,7 @@ static int tps43_channel_get(const struct device *dev, enum sensor_channel chan,
         k_mutex_unlock(&data->lock);
         return -ENOTSUP;
     }
-    
+
     k_mutex_unlock(&data->lock);
     return 0;
 }
@@ -388,17 +469,17 @@ static int tps43_trigger_set(const struct device *dev, const struct sensor_trigg
     struct tps43_data *data = dev->data;
     const struct tps43_config *config = dev->config;
     int ret = 0;
-    
+
     k_mutex_lock(&data->lock, K_FOREVER);
-    
+
     if (trig->type != SENSOR_TRIG_DATA_READY) {
         ret = -ENOTSUP;
         goto unlock;
     }
-    
+
     data->trigger_handler = handler;
     data->trigger = trig;
-    
+
     if (handler) {
         /* Enable interrupt */
         ret = gpio_pin_interrupt_configure_dt(&config->int_gpio, GPIO_INT_EDGE_FALLING);
@@ -410,7 +491,7 @@ static int tps43_trigger_set(const struct device *dev, const struct sensor_trigg
         /* Disable interrupt */
         ret = gpio_pin_interrupt_configure_dt(&config->int_gpio, GPIO_INT_DISABLE);
     }
-    
+
 unlock:
     k_mutex_unlock(&data->lock);
     return ret;
@@ -422,13 +503,17 @@ static const struct sensor_driver_api tps43_driver_api = {
     .trigger_set = tps43_trigger_set,
 };
 
+/* ============================================================================
+ * Driver Initialization
+ * ============================================================================ */
+
 static int tps43_init(const struct device *dev)
 {
     struct tps43_data *data = dev->data;
     const struct tps43_config *config = dev->config;
     int ret;
 
-    LOG_INF("TPS43 driver initializing...");
+    LOG_INF("IQS5xx driver initializing...");
     LOG_INF("I2C bus: %s", config->i2c.bus->name);
     LOG_INF("Target I2C address: 0x%02X", config->i2c.addr);
 
@@ -436,116 +521,49 @@ static int tps43_init(const struct device *dev)
 
     /* Initialize mutex */
     k_mutex_init(&data->lock);
-    
+
     /* Initialize work queue */
     k_work_init_delayable(&data->work, tps43_work_handler);
-    
-    /* Check I2C bus readiness */
-    LOG_INF("Checking I2C bus (SDA: P0.17/pin 2, SCL: P0.20/pin 3)...");
-    LOG_INF("  I2C device: %s", config->i2c.bus->name);
 
+    /* Check I2C bus readiness */
+    LOG_INF("Checking I2C bus...");
     if (!i2c_is_ready_dt(&config->i2c)) {
-        LOG_ERR("  ✗ I2C bus NOT ready!");
-        LOG_ERR("  Check: 1) I2C pins properly configured in pinctrl");
-        LOG_ERR("  Check: 2) I2C peripheral enabled in devicetree");
-        LOG_ERR("  Check: 3) Pull-up resistors enabled");
+        LOG_ERR("✗ I2C bus NOT ready!");
         return -ENODEV;
     }
+    LOG_INF("✓ I2C bus is ready!");
 
-    LOG_INF("  ✓ I2C bus is ready!");
-
-    /* Read GPIO pin states for I2C lines */
+    /* Read GPIO pin states for debugging */
     const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
     if (device_is_ready(gpio0)) {
-        int sda_state = gpio_pin_get_raw(gpio0, 17);  // P0.17 = SDA
-        int scl_state = gpio_pin_get_raw(gpio0, 20);  // P0.20 = SCL
+        int sda_state = gpio_pin_get_raw(gpio0, 17);  /* P0.17 = SDA */
+        int scl_state = gpio_pin_get_raw(gpio0, 20);  /* P0.20 = SCL */
         LOG_INF("GPIO Pin States:");
         LOG_INF("  SDA (P0.17): %s (%d)", sda_state ? "HIGH" : "LOW", sda_state);
         LOG_INF("  SCL (P0.20): %s (%d)", scl_state ? "HIGH" : "LOW", scl_state);
-    } else {
-        LOG_WRN("Could not read GPIO pin states");
     }
 
-    /* Scan I2C bus for devices - show ALL results including errors */
+    /* Scan I2C bus for devices */
     int found_devices = 0;
-    LOG_INF("Scanning I2C bus for devices (showing all results)...");
+    LOG_INF("Scanning I2C bus for devices...");
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
         uint8_t dummy_buf;
-
-        /* Use raw I2C API to scan different addresses */
         ret = i2c_write_read(config->i2c.bus, addr, NULL, 0, &dummy_buf, 0);
         if (ret == 0) {
             LOG_INF("  0x%02X: ACK (device found!)", addr);
             found_devices++;
-        } else {
-            LOG_DBG("  0x%02X: NACK (error %d)", addr, ret);
         }
     }
+    LOG_INF("I2C scan complete: Found %d device(s)", found_devices);
 
-    if (found_devices == 0) {
-        LOG_WRN("I2C scan complete: No devices found on the bus!");
-    } else {
-        LOG_INF("I2C scan complete: Found %d device(s)", found_devices);
-    }
-
-    LOG_INF("Attempting to communicate with TPS43 at address 0x%02X", config->i2c.addr);
-
-    /* Configure reset GPIO */
-    LOG_INF("Checking RST GPIO (Pro Micro pin 9 → P0.08)...");
-    if (config->rst_gpio.port != NULL) {
-        // LOG_INF("  RST GPIO port: %s, pin: %d", config->rst_gpio.port->name, config->rst_gpio.pin);
-        // if (gpio_is_ready_dt(&config->rst_gpio)) {
-        //     LOG_INF("  RST GPIO is ready, configuring as output...");
-        //     ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_ACTIVE);
-        //     if (ret < 0) {
-        //         LOG_ERR("  ✗ Failed to configure reset GPIO: %d", ret);
-        //         return ret; 
-        //     }
-        //     LOG_INF("  ✓ RST GPIO configured successfully");
-        // } else {
-        //     LOG_ERR("  ✗ RST GPIO not ready!");
-        //     return -ENODEV;
-        // }
-    } else {
-        LOG_WRN("  RST GPIO not specified in devicetree");
-    }
-    
-    /* Configure interrupt GPIO */
-    LOG_INF("Checking INT GPIO (Pro Micro pin 8 → P0.06)...");
-    if (config->int_gpio.port != NULL) {
-        LOG_INF("  INT GPIO port: %s, pin: %d", config->int_gpio.port->name, config->int_gpio.pin);
-        if (gpio_is_ready_dt(&config->int_gpio)) {
-        //     LOG_INF("  INT GPIO is ready, configuring as input...");
-        //     ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
-        //     if (ret < 0) {
-        //         LOG_ERR("  ✗ Failed to configure interrupt GPIO: %d", ret);
-        //         return ret;
-        //     }
-        //     LOG_INF("  ✓ INT GPIO configured successfully");
-
-        //     LOG_INF("  Adding GPIO callback...");
-        //     gpio_init_callback(&data->gpio_cb, tps43_gpio_callback, BIT(config->int_gpio.pin));
-        //     ret = gpio_add_callback(config->int_gpio.port, &data->gpio_cb);
-        //     if (ret < 0) {
-        //         LOG_ERR("  ✗ Failed to add GPIO callback: %d", ret);
-        //         return ret;
-        //     }
-        //     LOG_INF("  ✓ GPIO callback added successfully");
-        } else {
-            LOG_WRN("  INT GPIO not ready (will use polling mode)");
-        }
-    } else {
-        LOG_INF("  INT GPIO not specified, using polling mode");
-    }
-    
     /* Initialize device */
-    ret = tps43_device_init(dev);
+    ret = iqs5xx_device_init(dev);
     if (ret < 0) {
         LOG_ERR("Device initialization failed: %d", ret);
         return ret;
     }
-    
-    LOG_INF("TPS43 driver initialized successfully");
+
+    LOG_INF("IQS5xx driver initialized successfully");
     return 0;
 }
 
@@ -554,10 +572,10 @@ static int tps43_init(const struct device *dev)
                                                                              \
     static const struct tps43_config tps43_config_##inst = {                \
         .i2c = I2C_DT_SPEC_INST_GET(inst),                                 \
-        .int_gpio = {0} /* GPIO_DT_SPEC_INST_GET_OR(inst, int_gpios, {0}) */,        \
-        .rst_gpio = {0} /* GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}) */,        \
-        .resolution_x = DT_INST_PROP_OR(inst, resolution_x, 0),            \
-        .resolution_y = DT_INST_PROP_OR(inst, resolution_y, 0),            \
+        .int_gpio = {0},                                                    \
+        .rst_gpio = {0},                                                    \
+        .resolution_x = DT_INST_PROP_OR(inst, resolution_x, 2048),         \
+        .resolution_y = DT_INST_PROP_OR(inst, resolution_y, 1792),         \
         .invert_x = DT_INST_PROP_OR(inst, invert_x, false),                \
         .invert_y = DT_INST_PROP_OR(inst, invert_y, false),                \
         .swap_xy = DT_INST_PROP_OR(inst, swap_xy, false),                  \
@@ -568,4 +586,4 @@ static int tps43_init(const struct device *dev)
                                 POST_KERNEL, CONFIG_SENSOR_INIT_PRIORITY,    \
                                 &tps43_driver_api);
 
-DT_INST_FOREACH_STATUS_OKAY(TPS43_DEFINE) 
+DT_INST_FOREACH_STATUS_OKAY(TPS43_DEFINE)

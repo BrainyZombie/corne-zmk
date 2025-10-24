@@ -12,70 +12,61 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
 
-/* TPS43 with IQS572 controller register definitions - Based on actual IQS572 datasheet */
-#define TPS43_REG_DEVICE_INFO       0x00
-#define TPS43_REG_SYS_INFO_0        0x01
-#define TPS43_REG_SYS_INFO_1        0x02
-#define TPS43_REG_VERSION_INFO      0x03
-#define TPS43_REG_XY_INFO_0         0x10
-#define TPS43_REG_XY_INFO_1         0x11
-#define TPS43_REG_TOUCH_STRENGTH    0x12
-#define TPS43_REG_TOUCH_AREA        0x13
-#define TPS43_REG_COORDINATES_X     0x14
-#define TPS43_REG_COORDINATES_Y     0x16
-#define TPS43_REG_PROX_STATUS       0x20
-#define TPS43_REG_TOUCH_STATUS      0x21
-#define TPS43_REG_COUNTS            0x22
-#define TPS43_REG_LTA               0x23
-#define TPS43_REG_DELTAS            0x24
-#define TPS43_REG_MULTIPLIERS       0x25
-#define TPS43_REG_COMPENSATION      0x26
-#define TPS43_REG_PROX_SETTINGS     0x40
-#define TPS43_REG_THRESHOLDS        0x41
-#define TPS43_REG_TIMINGS_0         0x42
-#define TPS43_REG_TIMINGS_1         0x43
-#define TPS43_REG_GESTURE_TIMERS    0x44
-#define TPS43_REG_ACTIVE_CHANNELS   0x45
+/* IQS5xx-B000 Register Definitions (16-bit addresses, big-endian) */
+#define IQS5XX_PROD_NUM             0x0000  /* Product number (2 bytes) */
+#define IQS5XX_SYS_INFO0            0x000F  /* System info 0 - touch data starts here */
+#define IQS5XX_SYS_INFO1            0x0010  /* System info 1 */
+#define IQS5XX_NUM_FINGERS          0x0011  /* Number of fingers */
+#define IQS5XX_REL_X                0x0012  /* Relative X */
+#define IQS5XX_REL_Y                0x0013  /* Relative Y */
+#define IQS5XX_ABS_X                0x0014  /* Absolute X (first finger) */
+#define IQS5XX_ABS_Y                0x0016  /* Absolute Y (first finger) */
+#define IQS5XX_TOUCH_STRENGTH       0x0018  /* Touch strength */
+#define IQS5XX_AREA                 0x001A  /* Touch area */
 
-/* IQS572 specific configuration registers */
-#define TPS43_REG_SYS_CONFIG        0x50
-#define TPS43_REG_FILTER_SETTINGS   0x51
-#define TPS43_REG_POWER_MODE        0x52
+#define IQS5XX_SYS_CTRL0            0x0431  /* System control 0 - ACK/reset */
+#define IQS5XX_SYS_CTRL1            0x0432  /* System control 1 */
+#define IQS5XX_SYS_CFG0             0x058E  /* System config 0 */
+#define IQS5XX_SYS_CFG1             0x058F  /* System config 1 */
+#define IQS5XX_X_RES                0x066E  /* X resolution (2 bytes) */
+#define IQS5XX_Y_RES                0x0670  /* Y resolution (2 bytes) */
+#define IQS5XX_END_COMM             0xEEEE  /* End communication window */
 
-/* IQS572 specific values for TPS43 */
-#define TPS43_MAX_X                 2048
-#define TPS43_MAX_Y                 1792
-#define TPS43_MAX_TOUCH_POINTS      5
+/* Product Numbers */
+#define IQS5XX_PROD_NUM_IQS550      40
+#define IQS5XX_PROD_NUM_IQS572      58      /* 0x003A */
+#define IQS5XX_PROD_NUM_IQS525      52
 
-/* IQS572 device ID */
-#define TPS43_DEVICE_ID             0x41  /* Expected device ID for IQS572 */
+/* System Control 0 bits */
+#define IQS5XX_ACK_RESET            BIT(0)  /* Acknowledge event */
 
-/* IQS572 system configuration flags */
-#define TPS43_SYS_CFG_FLIP_X        BIT(0)
-#define TPS43_SYS_CFG_FLIP_Y        BIT(1)
-#define TPS43_SYS_CFG_SWITCH_XY     BIT(2)
-#define TPS43_SYS_CFG_TP_EVENT      BIT(3)
-#define TPS43_SYS_CFG_PROX_EVENT    BIT(4)
+/* System Config 0 bits */
+#define IQS5XX_SETUP_COMPLETE       BIT(7)  /* Setup mode complete */
+#define IQS5XX_SW_RESET             BIT(6)  /* Software reset */
+#define IQS5XX_WDT                  BIT(5)  /* Watchdog enable */
+#define IQS5XX_ALP_REATI            BIT(4)  /* ALP re-ATI */
+#define IQS5XX_REATI                BIT(3)  /* Re-ATI */
+#define IQS5XX_MANUAL_CONTROL       BIT(2)  /* Manual control */
+#define IQS5XX_SUSPEND              BIT(1)  /* Suspend */
 
-/* Touch detection flags */
-#define TPS43_XY_INFO_TOUCH_MASK    0x01
+/* System Config 1 bits */
+#define IQS5XX_FLIP_X               BIT(7)  /* Flip X coordinates */
+#define IQS5XX_FLIP_Y               BIT(6)  /* Flip Y coordinates */
+#define IQS5XX_SWITCH_XY            BIT(5)  /* Swap X and Y */
+#define IQS5XX_TP_EVENT             BIT(2)  /* Touch/prox events */
+#define IQS5XX_GESTURE_EVENT        BIT(1)  /* Gesture events */
+#define IQS5XX_EVENT_MODE           BIT(0)  /* Event mode enable */
 
-/* IQS572 expected product ID */
-#define TPS43_EXPECTED_PRODUCT_ID   0x58  /* Expected device ID for IQS572 */
+/* Touch data constants */
+#define IQS5XX_MAX_TOUCHES          5       /* Maximum simultaneous touches */
+#define IQS5XX_FINGERS_SIZE         10      /* Bytes per finger data */
 
-/* Error recovery thresholds */
-#define TPS43_MAX_ERROR_COUNT       5
+/* Timing constants (from kernel driver) */
+#define IQS5XX_ATI_WAIT_MS          250     /* Wait after config for ATI */
+#define IQS5XX_RESET_DELAY_MS       20      /* Delay after reset */
 
-/* Device state flags */
-#define TPS43_SHOW_RESET            BIT(7)
-#define TPS43_TOUCH_EVENT           BIT(0)
-#define TPS43_PROX_EVENT            BIT(1)
-
-/* Communication timeouts and retry counts */
-#define TPS43_I2C_TIMEOUT_MS        100
-#define TPS43_INIT_TIMEOUT_MS       500
-#define TPS43_MAX_RETRIES           3
-
+/* Error recovery */
+#define IQS5XX_MAX_ERROR_COUNT      5
 
 void tps43_ready_callback(const struct device *gpio_dev,
 			  struct gpio_callback *cb, uint32_t pins);
@@ -83,4 +74,4 @@ void tps43_ready_callback(const struct device *gpio_dev,
 /* Forward declaration for GPIO callback structure */
 struct gpio_callback;
 
-#endif /* ZEPHYR_DRIVERS_SENSOR_TPS43_H_ */ 
+#endif /* ZEPHYR_DRIVERS_SENSOR_TPS43_H_ */
