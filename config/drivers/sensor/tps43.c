@@ -101,25 +101,35 @@ static int tps43_i2c_write_reg(const struct device *dev, uint8_t reg, uint8_t *d
 
 static int tps43_verify_device_id(const struct device *dev)
 {
+    const struct tps43_config *config = dev->config;
     uint8_t device_info[2];
     int ret;
-    
+
+    LOG_INF("Reading device ID from I2C address 0x%02X...", config->i2c.addr);
     ret = tps43_i2c_read_reg(dev, TPS43_REG_DEVICE_INFO, device_info, 2);
     if (ret < 0) {
-        LOG_ERR("Failed to read device info");
+        LOG_ERR("  ✗ Failed to read device info (error: %d)", ret);
+        LOG_ERR("  Possible causes:");
+        LOG_ERR("    - Device not connected or powered");
+        LOG_ERR("    - Wrong I2C address (try 0x75 if using 0x74)");
+        LOG_ERR("    - Wiring issue (SDA/SCL swapped or disconnected)");
+        LOG_ERR("    - Pull-up resistors missing");
         return ret;
     }
-    
+
     uint16_t product_id = sys_get_le16(device_info);
-    LOG_INF("Device Product ID: 0x%04x", product_id);
-    
+    LOG_INF("  ✓ Device Product ID: 0x%04X", product_id);
+
     /* IQS572 should return specific product ID */
     if (product_id != TPS43_EXPECTED_PRODUCT_ID) {
-        LOG_WRN("Unexpected product ID: 0x%04x, expected: 0x%04x", 
+        LOG_WRN("  ⚠ Unexpected product ID: 0x%04X (expected: 0x%04X)",
                 product_id, TPS43_EXPECTED_PRODUCT_ID);
+        LOG_WRN("  Device may not be IQS572/TPS43");
         /* Don't fail completely - some variants might have different IDs */
+    } else {
+        LOG_INF("  ✓ Product ID matches IQS572 controller");
     }
-    
+
     return 0;
 }
 
@@ -127,27 +137,34 @@ static int tps43_device_reset(const struct device *dev)
 {
     const struct tps43_config *config = dev->config;
     struct tps43_data *data = dev->data;
-    
+
+    if (config->rst_gpio.port == NULL) {
+        LOG_WRN("No reset GPIO configured, skipping hardware reset");
+        return 0;
+    }
+
     if (!gpio_is_ready_dt(&config->rst_gpio)) {
-        LOG_ERR("Reset GPIO not ready");
+        LOG_ERR("  ✗ Reset GPIO not ready!");
         return -ENODEV;
     }
-    
-    LOG_INF("Performing hardware reset");
-    
+
+    LOG_INF("Performing hardware reset via RST pin...");
+
     /* Reset sequence: LOW -> wait -> HIGH -> wait */
     gpio_pin_set_dt(&config->rst_gpio, 0);
     k_msleep(10);
     gpio_pin_set_dt(&config->rst_gpio, 1);
     k_msleep(50); /* Allow device to boot */
-    
+
+    LOG_INF("  ✓ Hardware reset complete, device should be ready");
+
     /* Reset driver state */
     data->device_ready = false;
     data->error_count = 0;
     data->x = 0;
     data->y = 0;
     data->touch_state = 0;
-    
+
     return 0;
 }
 
@@ -158,7 +175,7 @@ static int tps43_configure_device(const struct device *dev)
     int ret;
     
     /* Read current system configuration */
-    ret = tps43_i2c_read_reg(dev, TPS43_REG_SYS_CONFIG_0, sys_cfg, 2);
+    ret = tps43_i2c_read_reg(dev, TPS43_REG_SYS_CONFIG, sys_cfg, 2);
     if (ret < 0) {
         LOG_ERR("Failed to read system config");
         return ret;
@@ -178,26 +195,18 @@ static int tps43_configure_device(const struct device *dev)
     /* Enable touch and proximity detection */
     sys_cfg[1] |= TPS43_SYS_CFG_TP_EVENT | TPS43_SYS_CFG_PROX_EVENT;
     
-    ret = tps43_i2c_write_reg(dev, TPS43_REG_SYS_CONFIG_0, sys_cfg, 2);
+    ret = tps43_i2c_write_reg(dev, TPS43_REG_SYS_CONFIG, sys_cfg, 2);
     if (ret < 0) {
         LOG_ERR("Failed to write system config");
         return ret;
     }
-    
-    /* Set resolution if specified */
-    if (config->resolution_x > 0 || config->resolution_y > 0) {
-        uint8_t res_cfg[4];
-        sys_put_le16(config->resolution_x ? config->resolution_x : 1024, &res_cfg[0]);
-        sys_put_le16(config->resolution_y ? config->resolution_y : 1024, &res_cfg[2]);
-        
-        ret = tps43_i2c_write_reg(dev, TPS43_REG_X_RESOLUTION, res_cfg, 4);
-        if (ret < 0) {
-            LOG_ERR("Failed to set resolution");
-            return ret;
-        }
-    }
-    
-    LOG_INF("Device configured successfully");
+
+    /* Note: TPS43 (IQS572) has fixed hardware resolution (2048x1792)
+     * The resolution_x/y config values are for coordinate scaling only,
+     * not written to device registers. */
+    LOG_INF("Device configured successfully (resolution: %dx%d)",
+            config->resolution_x, config->resolution_y);
+
     return 0;
 }
 
@@ -205,32 +214,35 @@ static int tps43_device_init(const struct device *dev)
 {
     struct tps43_data *data = dev->data;
     int ret;
-    
+
+    LOG_INF("=== Starting TPS43 device initialization ===");
+
     /* Reset device first */
     ret = tps43_device_reset(dev);
     if (ret < 0) {
-        LOG_ERR("Device reset failed");
+        LOG_ERR("✗ Device reset failed (error: %d)", ret);
         return ret;
     }
-    
+
     /* Verify device ID */
     ret = tps43_verify_device_id(dev);
     if (ret < 0) {
-        LOG_ERR("Device verification failed");
+        LOG_ERR("✗ Device verification failed (error: %d)", ret);
         return ret;
     }
-    
+
     /* Configure device */
+    LOG_INF("Configuring device registers...");
     ret = tps43_configure_device(dev);
     if (ret < 0) {
-        LOG_ERR("Device configuration failed");
+        LOG_ERR("✗ Device configuration failed (error: %d)", ret);
         return ret;
     }
-    
+
     data->device_ready = true;
     data->initialized = true;
-    
-    LOG_INF("TPS43 device initialized successfully");
+
+    LOG_INF("=== ✓ TPS43 device initialized successfully ===");
     return 0;
 }
 
@@ -315,7 +327,7 @@ static void tps43_work_handler(struct k_work *work)
 
 static void tps43_gpio_callback(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
-    struct tps43_data *data = CONTAINER_OF(cb, struct tps43_data, gpio_cb);
+    // struct tps43_data *data = CONTAINER_OF(cb, struct tps43_data, gpio_cb);
     
     /* Schedule work to handle interrupt in work queue context */
     k_work_reschedule(&data->work, K_NO_WAIT);
@@ -406,9 +418,13 @@ static int tps43_init(const struct device *dev)
     struct tps43_data *data = dev->data;
     const struct tps43_config *config = dev->config;
     int ret;
-    
+
+    LOG_INF("TPS43 driver initializing...");
+    LOG_INF("I2C bus: %s", config->i2c.bus->name);
+    LOG_INF("Target I2C address: 0x%02X", config->i2c.addr);
+
     data->dev = dev;
-    
+
     /* Initialize mutex */
     k_mutex_init(&data->lock);
     
@@ -416,34 +432,90 @@ static int tps43_init(const struct device *dev)
     k_work_init_delayable(&data->work, tps43_work_handler);
     
     /* Check I2C bus readiness */
+    LOG_INF("Checking I2C bus (SDA: P0.17/pin 2, SCL: P0.20/pin 3)...");
+    LOG_INF("  I2C device: %s", config->i2c.bus->name);
+
     if (!i2c_is_ready_dt(&config->i2c)) {
-        LOG_ERR("I2C bus not ready");
+        LOG_ERR("  ✗ I2C bus NOT ready!");
+        LOG_ERR("  Check: 1) I2C pins properly configured in pinctrl");
+        LOG_ERR("  Check: 2) I2C peripheral enabled in devicetree");
+        LOG_ERR("  Check: 3) Pull-up resistors enabled");
         return -ENODEV;
     }
-    
-    /* Configure reset GPIO */
-    if (gpio_is_ready_dt(&config->rst_gpio)) {
-        ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_ACTIVE);
-        if (ret < 0) {
-            LOG_ERR("Failed to configure reset GPIO: %d", ret);
-            return ret;
+
+    LOG_INF("  ✓ I2C bus is ready!");
+    LOG_INF("I2C bus scanning for devices...");
+
+    /* Scan I2C bus for devices (7-bit addressing: 0x08 to 0x77) */
+    int found_devices = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        struct i2c_msg msg = {
+            .buf = NULL,
+            .len = 0,
+            .flags = I2C_MSG_WRITE | I2C_MSG_STOP,
+        };
+
+        ret = i2c_transfer_dt(&config->i2c, &msg, 1);
+        if (ret == 0) {
+            LOG_INF("  Found I2C device at address 0x%02X", addr);
+            found_devices++;
         }
+    }
+
+    if (found_devices == 0) {
+        LOG_WRN("I2C scan complete: No devices found on the bus!");
+    } else {
+        LOG_INF("I2C scan complete: Found %d device(s)", found_devices);
+    }
+
+    LOG_INF("Attempting to communicate with TPS43 at address 0x%02X", config->i2c.addr);
+
+    /* Configure reset GPIO */
+    LOG_INF("Checking RST GPIO (Pro Micro pin 9 → P0.08)...");
+    if (config->rst_gpio.port != NULL) {
+        LOG_INF("  RST GPIO port: %s, pin: %d", config->rst_gpio.port->name, config->rst_gpio.pin);
+        if (gpio_is_ready_dt(&config->rst_gpio)) {
+            LOG_INF("  RST GPIO is ready, configuring as output...");
+            ret = gpio_pin_configure_dt(&config->rst_gpio, GPIO_OUTPUT_ACTIVE);
+            if (ret < 0) {
+                LOG_ERR("  ✗ Failed to configure reset GPIO: %d", ret);
+                return ret;
+            }
+            LOG_INF("  ✓ RST GPIO configured successfully");
+        } else {
+            LOG_ERR("  ✗ RST GPIO not ready!");
+            return -ENODEV;
+        }
+    } else {
+        LOG_WRN("  RST GPIO not specified in devicetree");
     }
     
     /* Configure interrupt GPIO */
-    if (gpio_is_ready_dt(&config->int_gpio)) {
-        ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
-        if (ret < 0) {
-            LOG_ERR("Failed to configure interrupt GPIO: %d", ret);
-            return ret;
+    LOG_INF("Checking INT GPIO (Pro Micro pin 8 → P0.06)...");
+    if (config->int_gpio.port != NULL) {
+        LOG_INF("  INT GPIO port: %s, pin: %d", config->int_gpio.port->name, config->int_gpio.pin);
+        if (gpio_is_ready_dt(&config->int_gpio)) {
+            LOG_INF("  INT GPIO is ready, configuring as input...");
+            ret = gpio_pin_configure_dt(&config->int_gpio, GPIO_INPUT);
+            if (ret < 0) {
+                LOG_ERR("  ✗ Failed to configure interrupt GPIO: %d", ret);
+                return ret;
+            }
+            LOG_INF("  ✓ INT GPIO configured successfully");
+
+            LOG_INF("  Adding GPIO callback...");
+            gpio_init_callback(&data->gpio_cb, tps43_gpio_callback, BIT(config->int_gpio.pin));
+            ret = gpio_add_callback(config->int_gpio.port, &data->gpio_cb);
+            if (ret < 0) {
+                LOG_ERR("  ✗ Failed to add GPIO callback: %d", ret);
+                return ret;
+            }
+            LOG_INF("  ✓ GPIO callback added successfully");
+        } else {
+            LOG_WRN("  INT GPIO not ready (will use polling mode)");
         }
-        
-        gpio_init_callback(&data->gpio_cb, tps43_gpio_callback, BIT(config->int_gpio.pin));
-        ret = gpio_add_callback(config->int_gpio.port, &data->gpio_cb);
-        if (ret < 0) {
-            LOG_ERR("Failed to add GPIO callback: %d", ret);
-            return ret;
-        }
+    } else {
+        LOG_INF("  INT GPIO not specified, using polling mode");
     }
     
     /* Initialize device */
@@ -466,9 +538,9 @@ static int tps43_init(const struct device *dev)
         .rst_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, rst_gpios, {0}),        \
         .resolution_x = DT_INST_PROP_OR(inst, resolution_x, 0),            \
         .resolution_y = DT_INST_PROP_OR(inst, resolution_y, 0),            \
-        .invert_x = DT_INST_PROP(inst, invert_x),                          \
-        .invert_y = DT_INST_PROP(inst, invert_y),                          \
-        .swap_xy = DT_INST_PROP(inst, swap_xy),                            \
+        .invert_x = DT_INST_PROP_OR(inst, invert_x, false),                \
+        .invert_y = DT_INST_PROP_OR(inst, invert_y, false),                \
+        .swap_xy = DT_INST_PROP_OR(inst, swap_xy, false),                  \
     };                                                                       \
                                                                              \
     SENSOR_DEVICE_DT_INST_DEFINE(inst, tps43_init, NULL,                   \

@@ -50,7 +50,8 @@
     tps43: trackpad@74 {
         compatible = "azoteq,tps43";
         reg = <0x74>;
-        
+        status = "okay";
+
         /* 43mm trackpad variant per datasheet */
         variant = "43mm";
         
