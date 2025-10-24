@@ -457,20 +457,19 @@ static int tps43_init(const struct device *dev)
         LOG_WRN("Could not read GPIO pin states");
     }
 
-    /* Scan I2C bus for devices */
+    /* Scan I2C bus for devices - show ALL results including errors */
     int found_devices = 0;
-    LOG_INF("Scanning I2C bus for devices...");
+    LOG_INF("Scanning I2C bus for devices (showing all results)...");
     for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
-        struct i2c_msg msg = {
-            .buf = NULL,
-            .len = 0,
-            .flags = I2C_MSG_WRITE | I2C_MSG_STOP,
-        };
+        uint8_t dummy_buf;
 
-        ret = i2c_transfer_dt(&config->i2c, &msg, 1);
+        /* Use raw I2C API to scan different addresses */
+        ret = i2c_write_read(config->i2c.bus, addr, NULL, 0, &dummy_buf, 0);
         if (ret == 0) {
-            LOG_INF("  Found I2C device at address 0x%02X", addr);
+            LOG_INF("  0x%02X: ACK (device found!)", addr);
             found_devices++;
+        } else {
+            LOG_DBG("  0x%02X: NACK (error %d)", addr, ret);
         }
     }
 
