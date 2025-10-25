@@ -12,11 +12,20 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/input/input.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/byteorder.h>
 
 LOG_MODULE_REGISTER(tps43, CONFIG_SENSOR_LOG_LEVEL);
+
+/* Input event codes (from Linux input event codes) */
+#ifndef INPUT_REL_X
+#define INPUT_REL_X 0x00
+#endif
+#ifndef INPUT_REL_Y
+#define INPUT_REL_Y 0x01
+#endif
 
 /* Forward declarations */
 static int iqs5xx_device_init(const struct device *dev);
@@ -35,6 +44,11 @@ struct tps43_data {
     int16_t y;
     uint8_t touch_state;
     uint8_t touch_strength;
+
+    /* Position tracking for delta calculation */
+    int16_t last_x;
+    int16_t last_y;
+    bool was_touching;
 
     /* Device state */
     bool device_ready;
@@ -427,8 +441,35 @@ static int iqs5xx_read_touch_data(const struct device *dev)
 
         LOG_INF("✓ TOUCH DETECTED: fingers=%d x=%d y=%d strength=%d",
                 num_active, data->x, data->y, data->touch_strength);
+
+        /* Calculate deltas for cursor movement (only if finger was already down) */
+        if (data->was_touching) {
+            int16_t delta_x = data->x - data->last_x;
+            int16_t delta_y = data->y - data->last_y;
+
+            /* Report relative movement to ZMK if there's actual movement */
+            if (delta_x != 0 || delta_y != 0) {
+                LOG_DBG("Reporting movement: dx=%d dy=%d", delta_x, delta_y);
+                input_report_rel(dev, INPUT_REL_X, delta_x, false, K_NO_WAIT);
+                input_report_rel(dev, INPUT_REL_Y, delta_y, true, K_NO_WAIT);  /* sync=true on last */
+            }
+        } else {
+            LOG_INF("Initial touch - not reporting movement yet");
+        }
+
+        /* Update last position for next delta calculation */
+        data->last_x = data->x;
+        data->last_y = data->y;
+        data->was_touching = true;
     } else {
+        /* Finger lifted - reset position tracking */
+        if (data->was_touching) {
+            LOG_INF("Touch released");
+        }
         data->touch_state = 0;
+        data->was_touching = false;
+        data->last_x = 0;
+        data->last_y = 0;
         LOG_DBG("No touch detected (num_active=%d)", num_active);
     }
 

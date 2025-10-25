@@ -6,6 +6,13 @@
 
 #include "corne_tps43.dtsi"
 
+/ {
+    tps43_listener: tps43_listener {
+        compatible = "zmk,input-listener";
+        device = <&tps43>;
+    };
+};
+
 &default_transform {
     col-offset = <6>;
 };
