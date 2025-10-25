@@ -59,7 +59,7 @@
 
 /* Touch data constants */
 #define IQS5XX_MAX_TOUCHES          5       /* Maximum simultaneous touches */
-#define IQS5XX_FINGERS_SIZE         10      /* Bytes per finger data */
+#define IQS5XX_FINGER_SIZE          7       /* Bytes per finger data */
 
 /* Timing constants (from kernel driver) */
 #define IQS5XX_ATI_WAIT_MS          250     /* Wait after config for ATI */

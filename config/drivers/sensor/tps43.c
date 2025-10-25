@@ -213,9 +213,34 @@ static int iqs5xx_configure_device(const struct device *dev)
 {
     const struct tps43_config *config = dev->config;
     uint8_t sys_cfg[2];
+    uint8_t sys_info[2];
     int ret;
 
     LOG_INF("Configuring IQS5xx device...");
+
+    /* Read SYS_INFO to check for reset flag */
+    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_INFO0, sys_info, 2);
+    if (ret < 0) {
+        LOG_ERR("Failed to read system info");
+        return ret;
+    }
+
+    LOG_DBG("SYS_INFO: [0x%02X 0x%02X]", sys_info[0], sys_info[1]);
+
+    /* Check if device shows reset flag (bit 7 of SYS_INFO0) */
+    if (sys_info[0] & BIT(7)) {
+        LOG_INF("Device shows reset flag - acknowledging...");
+        ret = iqs5xx_ack_event(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to acknowledge reset");
+            return ret;
+        }
+        ret = iqs5xx_close_comms_window(dev);
+        if (ret < 0) {
+            return ret;
+        }
+        k_msleep(10);  /* Brief delay after ACK */
+    }
 
     /* Read current system configuration */
     ret = iqs5xx_read_reg(dev, IQS5XX_SYS_CFG0, sys_cfg, 2);
@@ -226,11 +251,15 @@ static int iqs5xx_configure_device(const struct device *dev)
 
     LOG_DBG("Current config: SYS_CFG0=0x%02X SYS_CFG1=0x%02X", sys_cfg[0], sys_cfg[1]);
 
-    /* Configure SYS_CFG0: Setup complete, enable WDT, enable re-ATI */
-    sys_cfg[0] = IQS5XX_SETUP_COMPLETE | IQS5XX_WDT | IQS5XX_REATI;
+    /* Configure SYS_CFG0: Setup complete, enable WDT, enable both re-ATI modes */
+    sys_cfg[0] = IQS5XX_SETUP_COMPLETE | IQS5XX_WDT | IQS5XX_ALP_REATI | IQS5XX_REATI;
 
-    /* Configure SYS_CFG1: Coordinate transformations and event mode */
-    sys_cfg[1] = IQS5XX_TP_EVENT | IQS5XX_EVENT_MODE;  /* Enable touch events */
+    /* Configure SYS_CFG1: Coordinate transformations
+     * NOTE: We DON'T set EVENT_MODE because we're polling without INT pin.
+     * EVENT_MODE makes the device only update registers when INT is asserted,
+     * but we need continuous updates for polling mode.
+     */
+    sys_cfg[1] = IQS5XX_TP_EVENT;  /* Enable touch events, but NOT event mode */
 
     if (config->invert_x) {
         sys_cfg[1] |= IQS5XX_FLIP_X;
@@ -262,6 +291,30 @@ static int iqs5xx_configure_device(const struct device *dev)
     /* Wait for Automatic Tuning Implementation (ATI) to complete */
     LOG_INF("Waiting %dms for ATI to complete...", IQS5XX_ATI_WAIT_MS);
     k_msleep(IQS5XX_ATI_WAIT_MS);
+
+    /* Read back configuration to verify */
+    uint8_t readback_cfg[2];
+    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_CFG0, readback_cfg, 2);
+    if (ret < 0) {
+        LOG_ERR("Failed to read back system config");
+        return ret;
+    }
+
+    LOG_INF("Readback config: SYS_CFG0=0x%02X SYS_CFG1=0x%02X", readback_cfg[0], readback_cfg[1]);
+
+    if (readback_cfg[0] != sys_cfg[0] || readback_cfg[1] != sys_cfg[1]) {
+        LOG_WRN("⚠ Configuration mismatch!");
+        LOG_WRN("  Expected: SYS_CFG0=0x%02X SYS_CFG1=0x%02X", sys_cfg[0], sys_cfg[1]);
+        LOG_WRN("  Got:      SYS_CFG0=0x%02X SYS_CFG1=0x%02X", readback_cfg[0], readback_cfg[1]);
+    } else {
+        LOG_INF("✓ Configuration verified successfully");
+    }
+
+    /* Close comms window after readback */
+    ret = iqs5xx_close_comms_window(dev);
+    if (ret < 0) {
+        return ret;
+    }
 
     LOG_INF("✓ Device configured successfully (resolution: %dx%d)",
             config->resolution_x, config->resolution_y);
@@ -310,15 +363,16 @@ static int iqs5xx_device_init(const struct device *dev)
 static int iqs5xx_read_touch_data(const struct device *dev)
 {
     struct tps43_data *data = dev->data;
-    uint8_t touch_data[43];  /* SYS_INFO0 + full finger data */
+    /* Status structure: 2 (sys_info) + 1 (num_active) + 4 (rel_x/y) + 35 (5 fingers * 7 bytes) = 42 bytes */
+    uint8_t status[42];
     int ret;
 
     if (!data->device_ready) {
         return -ENODEV;
     }
 
-    /* Read from SYS_INFO0: includes num_fingers + all finger data */
-    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_INFO0, touch_data, sizeof(touch_data));
+    /* Read from SYS_INFO0: complete status structure */
+    ret = iqs5xx_read_reg(dev, IQS5XX_SYS_INFO0, status, sizeof(status));
     if (ret < 0) {
         LOG_ERR("Failed to read touch data");
         data->error_count++;
@@ -333,32 +387,49 @@ static int iqs5xx_read_touch_data(const struct device *dev)
     /* Reset error count on successful read */
     data->error_count = 0;
 
-    /* Parse touch data
-     * Byte 0-1: SYS_INFO (we skip this for now)
-     * Byte 2: Number of fingers
-     * Byte 3-12: First finger data (if present)
-     *   - Bytes 3-4: Reserved
-     *   - Bytes 5-6: Absolute X (big-endian)
-     *   - Bytes 7-8: Absolute Y (big-endian)
-     *   - Bytes 9-10: Touch strength (big-endian)
-     *   - Bytes 11-12: Area
+    /* Parse status structure (per Linux kernel driver):
+     * Bytes 0-1: sys_info[2]
+     * Byte 2: num_active
+     * Bytes 3-4: rel_x (relative X, big-endian)
+     * Bytes 5-6: rel_y (relative Y, big-endian)
+     * Bytes 7+: touch_data array (5 fingers * 7 bytes each)
+     *   Per finger (7 bytes):
+     *     Bytes 0-1: abs_x (big-endian)
+     *     Bytes 2-3: abs_y (big-endian)
+     *     Bytes 4-5: strength (big-endian)
+     *     Byte 6: area
      */
-    uint8_t num_fingers = touch_data[2];
+    uint8_t num_active = status[2];
 
-    if (num_fingers > 0 && num_fingers <= IQS5XX_MAX_TOUCHES) {
+    /* Debug: Show raw data and decode SYS_INFO */
+    LOG_INF("Status: SYS_INFO=[0x%02X 0x%02X] num_active=%d rel=[0x%02X%02X 0x%02X%02X] finger0=[0x%02X 0x%02X 0x%02X 0x%02X]",
+            status[0], status[1], num_active,
+            status[3], status[4], status[5], status[6],
+            status[7], status[8], status[9], status[10]);
+
+    /* Decode SYS_INFO flags (per Linux kernel driver) */
+    uint8_t sys_info0 = status[0];
+    uint8_t sys_info1 = status[1];
+    LOG_DBG("SYS_INFO0 bits: SHOW_RESET=%d SETUP_COMPLETE=%d",
+            (sys_info0 & BIT(7)) ? 1 : 0,  /* Show reset */
+            (sys_info0 & BIT(6)) ? 1 : 0); /* Setup complete */
+
+    if (num_active > 0 && num_active <= IQS5XX_MAX_TOUCHES) {
         data->touch_state = 1;
 
-        /* Parse first finger data (offset by 3 bytes for SYS_INFO + num_fingers) */
-        data->x = sys_get_be16(&touch_data[3 + 2]);  /* Skip 2 reserved bytes */
-        data->y = sys_get_be16(&touch_data[3 + 4]);
-        uint16_t strength = sys_get_be16(&touch_data[3 + 6]);
-        data->touch_strength = (strength >> 8) & 0xFF;  /* Use MSB */
+        /* First finger data starts at byte 7 */
+        const uint8_t *finger0 = &status[7];
 
-        LOG_DBG("Touch: fingers=%d x=%d y=%d strength=%d",
-                num_fingers, data->x, data->y, data->touch_strength);
+        data->x = sys_get_be16(&finger0[0]);  /* abs_x at bytes 0-1 */
+        data->y = sys_get_be16(&finger0[2]);  /* abs_y at bytes 2-3 */
+        uint16_t strength = sys_get_be16(&finger0[4]);  /* strength at bytes 4-5 */
+        data->touch_strength = strength & 0xFF;
+
+        LOG_INF("✓ TOUCH DETECTED: fingers=%d x=%d y=%d strength=%d",
+                num_active, data->x, data->y, data->touch_strength);
     } else {
         data->touch_state = 0;
-        LOG_DBG("No touch detected");
+        LOG_DBG("No touch detected (num_active=%d)", num_active);
     }
 
     /* Acknowledge the event */
@@ -408,6 +479,8 @@ static void tps43_work_handler(struct k_work *work)
     ret = iqs5xx_read_touch_data(dev);
     if (ret < 0) {
         k_mutex_unlock(&data->lock);
+        /* Retry after delay even on error */
+        k_work_reschedule(&data->work, K_MSEC(100));
         return;
     }
 
@@ -417,6 +490,9 @@ static void tps43_work_handler(struct k_work *work)
     }
 
     k_mutex_unlock(&data->lock);
+
+    /* Schedule next poll (100ms = 10Hz polling rate) */
+    k_work_reschedule(&data->work, K_MSEC(100));
 }
 
 /* ============================================================================
@@ -562,6 +638,10 @@ static int tps43_init(const struct device *dev)
         LOG_ERR("Device initialization failed: %d", ret);
         return ret;
     }
+
+    /* Start periodic polling (no INT pin connected) */
+    LOG_INF("Starting periodic polling mode (100ms interval = 10Hz)");
+    k_work_reschedule(&data->work, K_MSEC(100));
 
     LOG_INF("IQS5xx driver initialized successfully");
     return 0;
