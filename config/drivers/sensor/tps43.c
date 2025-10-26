@@ -521,7 +521,7 @@ static void tps43_work_handler(struct k_work *work)
     if (ret < 0) {
         k_mutex_unlock(&data->lock);
         /* Retry after delay even on error */
-        k_work_reschedule(&data->work, K_MSEC(100));
+        k_work_reschedule(&data->work, K_MSEC(CONFIG_ZMK_SENSOR_TPS43_POLL_RATE_MS));
         return;
     }
 
@@ -532,8 +532,8 @@ static void tps43_work_handler(struct k_work *work)
 
     k_mutex_unlock(&data->lock);
 
-    /* Schedule next poll (100ms = 10Hz polling rate) */
-    k_work_reschedule(&data->work, K_MSEC(100));
+    /* Schedule next poll using configured poll rate */
+    k_work_reschedule(&data->work, K_MSEC(CONFIG_ZMK_SENSOR_TPS43_POLL_RATE_MS));
 }
 
 /* ============================================================================
@@ -681,8 +681,8 @@ static int tps43_init(const struct device *dev)
     }
 
     /* Start periodic polling (no INT pin connected) */
-    LOG_INF("Starting periodic polling mode (100ms interval = 10Hz)");
-    k_work_reschedule(&data->work, K_MSEC(100));
+    LOG_INF("Starting periodic polling mode (%dms interval)", CONFIG_ZMK_SENSOR_TPS43_POLL_RATE_MS);
+    k_work_reschedule(&data->work, K_MSEC(CONFIG_ZMK_SENSOR_TPS43_POLL_RATE_MS));
 
     LOG_INF("IQS5xx driver initialized successfully");
     return 0;
