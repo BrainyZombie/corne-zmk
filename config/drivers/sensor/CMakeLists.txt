@@ -1,3 +1,4 @@
 zephyr_library()
 
+zephyr_library_sources_ifdef(CONFIG_ZMK_SENSOR_TPS43 tps43_ll.c)
 zephyr_library_sources_ifdef(CONFIG_ZMK_SENSOR_TPS43 tps43.c) 
